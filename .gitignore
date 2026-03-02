@@ -4,3 +4,4 @@ __pycache__/
 venv/
 *.h5
 model/
+uplaod_model.py
