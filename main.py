@@ -10,59 +10,67 @@ import tensorflow as tf
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from huggingface_hub import hf_hub_download
 from PIL import Image
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MODEL_PATH       = Path("model/plant_disease_efficientnet.keras")
 CLASS_NAMES_PATH = Path("model/class_names.json")
-IMG_SIZE         = (224, 224)   # EfficientNetB0 native size
+HF_REPO_ID       = "tanishq-jaiswal/plant-disease-model"
+IMG_SIZE         = (224, 224)
 MAX_FILE_SIZE_MB = 10
 
-# ── Global model state ────────────────────────────────────────────────────────
 ml_model: tf.keras.Model = None
 class_names: list[str]   = []
 
-# ── Lifespan (replaces deprecated @app.on_event) ──────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     global ml_model, class_names
-    logger.info("Loading model from %s ...", MODEL_PATH)
+
+    # ── Download model from Hugging Face if not already present ───────────────
+    if not MODEL_PATH.exists():
+        logger.info("Model not found locally. Downloading from Hugging Face...")
+        MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename="plant_disease_efficientnet.keras",
+            local_dir="model"
+        )
+        hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename="class_names.json",
+            local_dir="model"
+        )
+        logger.info("✅ Model downloaded from Hugging Face")
+    else:
+        logger.info("Model found locally. Skipping download.")
+
+    # ── Load model ────────────────────────────────────────────────────────────
+    logger.info("Loading model...")
     try:
         ml_model = tf.keras.models.load_model(str(MODEL_PATH))
-        logger.info("✅ Model loaded successfully")
-        logger.info("   Input shape  : %s", ml_model.input_shape)
-        logger.info("   Output shape : %s", ml_model.output_shape)
+        logger.info("✅ Model loaded | Input: %s | Output: %s",
+                    ml_model.input_shape, ml_model.output_shape)
     except Exception as e:
-        logger.error("❌ Model load failed: %s", e)
         raise RuntimeError(f"Could not load model: {e}")
 
-    logger.info("Loading class names from %s ...", CLASS_NAMES_PATH)
-    try:
-        with open(CLASS_NAMES_PATH) as f:
-            class_names = json.load(f)
-        logger.info("✅ Loaded %d class names", len(class_names))
-    except Exception as e:
-        logger.error("❌ Class names load failed: %s", e)
-        raise RuntimeError(f"Could not load class names: {e}")
+    # ── Load class names ──────────────────────────────────────────────────────
+    with open(CLASS_NAMES_PATH) as f:
+        class_names = json.load(f)
+    logger.info("✅ Loaded %d class names", len(class_names))
 
-    # Warmup — run one dummy prediction so the first real request isn't slow
-    logger.info("Running warmup prediction ...")
-    dummy = np.zeros((1, *IMG_SIZE, 3), dtype=np.float32)
-    ml_model.predict(dummy, verbose=0)
+    # ── Warmup ────────────────────────────────────────────────────────────────
+    logger.info("Running warmup prediction...")
+    ml_model.predict(np.zeros((1, *IMG_SIZE, 3), dtype=np.float32), verbose=0)
     logger.info("✅ Warmup complete. API is ready.")
 
-    yield  # App runs here
+    yield
 
-    # Shutdown
-    logger.info("Shutting down. Clearing model from memory.")
+    logger.info("Shutting down.")
     del ml_model
 
 # ── App ───────────────────────────────────────────────────────────────────────
