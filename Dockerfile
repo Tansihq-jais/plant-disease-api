@@ -32,12 +32,6 @@ COPY --from=builder /install /usr/local
 # Copy app code
 COPY main.py .
 
-# Copy model files into model/ subfolder
-# Ensure these files exist locally before building:
-#   model/plant_disease_efficientnet.keras
-#   model/class_names.json
-COPY model/ model/
-
 # Create non-root user for security
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
@@ -49,4 +43,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", \
-     "--workers", "1", "--log-level", "info", "--no-access-log"]
+    "--workers", "1", "--log-level", "info", "--no-access-log"]
