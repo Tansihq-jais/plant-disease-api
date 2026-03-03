@@ -6,7 +6,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
-import tensorflow as tf
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -14,49 +13,53 @@ from huggingface_hub import hf_hub_download
 from PIL import Image
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-MODEL_PATH       = Path("model/plant_disease_efficientnet.keras")
+MODEL_PATH       = Path("model/plant_disease_model.tflite")
 CLASS_NAMES_PATH = Path("model/class_names.json")
 HF_REPO_ID       = "tanishq-jaiswal/plant-disease-model"
 IMG_SIZE         = (224, 224)
 MAX_FILE_SIZE_MB = 10
 
-ml_model: tf.keras.Model = None
-class_names: list[str]   = []
+# ── Global model state ────────────────────────────────────────────────────────
+interpreter      = None
+input_details    = None
+output_details   = None
+class_names: list[str] = []
 
+# ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global ml_model, class_names
+    global interpreter, input_details, output_details, class_names
 
-    # ── Download model from Hugging Face if not already present ───────────────
+    # ── Download from Hugging Face if not present ─────────────────────────────
     if not MODEL_PATH.exists():
-        logger.info("Model not found locally. Downloading from Hugging Face...")
+        logger.info("Downloading model from Hugging Face...")
         MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-        hf_hub_download(
-            repo_id=HF_REPO_ID,
-            filename="plant_disease_efficientnet.keras",
-            local_dir="model"
-        )
-        hf_hub_download(
-            repo_id=HF_REPO_ID,
-            filename="class_names.json",
-            local_dir="model"
-        )
-        logger.info("✅ Model downloaded from Hugging Face")
+        hf_hub_download(repo_id=HF_REPO_ID, filename="plant_disease_model.tflite", local_dir="model")
+        hf_hub_download(repo_id=HF_REPO_ID, filename="class_names.json", local_dir="model")
+        logger.info("✅ Downloaded from Hugging Face")
     else:
         logger.info("Model found locally. Skipping download.")
 
-    # ── Load model ────────────────────────────────────────────────────────────
-    logger.info("Loading model...")
+    # ── Load TFLite model ─────────────────────────────────────────────────────
+    logger.info("Loading TFLite model...")
     try:
-        ml_model = tf.keras.models.load_model(str(MODEL_PATH))
-        logger.info("✅ Model loaded | Input: %s | Output: %s",
-                    ml_model.input_shape, ml_model.output_shape)
-    except Exception as e:
-        raise RuntimeError(f"Could not load model: {e}")
+        import tflite_runtime.interpreter as tflite
+        interpreter = tflite.Interpreter(model_path=str(MODEL_PATH))
+    except ImportError:
+        import tensorflow as tf
+        interpreter = tf.lite.Interpreter(model_path=str(MODEL_PATH))
+
+    interpreter.allocate_tensors()
+    input_details  = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    logger.info("✅ TFLite model loaded | Input shape: %s", input_details[0]['shape'])
 
     # ── Load class names ──────────────────────────────────────────────────────
     with open(CLASS_NAMES_PATH) as f:
@@ -65,13 +68,16 @@ async def lifespan(app: FastAPI):
 
     # ── Warmup ────────────────────────────────────────────────────────────────
     logger.info("Running warmup prediction...")
-    ml_model.predict(np.zeros((1, *IMG_SIZE, 3), dtype=np.float32), verbose=0)
+    dummy = np.zeros((1, *IMG_SIZE, 3), dtype=np.float32)
+    interpreter.set_tensor(input_details[0]['index'], dummy)
+    interpreter.invoke()
     logger.info("✅ Warmup complete. API is ready.")
 
     yield
 
     logger.info("Shutting down.")
-    del ml_model
+    del interpreter
+
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -104,23 +110,20 @@ async def add_process_time_header(request: Request, call_next):
 # ── Image preprocessing ───────────────────────────────────────────────────────
 def preprocess_image(image_bytes: bytes) -> np.ndarray:
     """
-    Decode → convert to RGB → resize to 224x224 → batch.
-    NOTE: Do NOT divide by 255. EfficientNetB0 normalizes internally.
-    Returns shape (1, 224, 224, 3) with pixel values in [0, 255].
+    Decode → RGB → resize to 224x224 → normalize to [0,1] for TFLite.
+    Returns shape (1, 224, 224, 3) as float32.
     """
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="Could not decode image. Ensure it is a valid JPG or PNG.")
-
     img = img.resize(IMG_SIZE, Image.BILINEAR)
-    arr = np.array(img, dtype=np.float32)          # [0, 255] — no normalization
-    return np.expand_dims(arr, axis=0)             # (1, 224, 224, 3)
+    arr = np.array(img, dtype=np.float32) / 255.0   # TFLite expects [0, 1]
+    return np.expand_dims(arr, axis=0)               # (1, 224, 224, 3)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def format_disease_name(raw: str) -> dict:
-    """Split 'Tomato___Late_blight' into plant and disease parts."""
-    parts = raw.split("___")
+    parts   = raw.split("___")
     plant   = parts[0].replace("_", " ") if len(parts) > 0 else raw
     disease = parts[1].replace("_", " ") if len(parts) > 1 else "Unknown"
     return {"plant": plant, "disease": disease, "raw": raw}
@@ -140,17 +143,15 @@ def root():
 
 @app.get("/health", tags=["General"])
 def health():
-    """Health check endpoint for Render / Docker / load balancers."""
     return {
         "status": "healthy",
-        "model_loaded": ml_model is not None,
+        "model_loaded": interpreter is not None,
         "num_classes": len(class_names),
     }
 
 
 @app.get("/classes", tags=["General"])
 def get_classes():
-    """Return all 38 supported disease classes."""
     return {
         "total": len(class_names),
         "classes": [format_disease_name(c) for c in class_names]
@@ -161,16 +162,7 @@ def get_classes():
 async def predict(file: UploadFile = File(..., description="Plant leaf image (JPG or PNG)")):
     """
     Predict plant disease from a leaf image.
-
-    - **file**: JPG or PNG image of a plant leaf (max 10MB)
-
-    Returns:
-    - `predicted_disease`: top predicted class
-    - `plant`: plant name
-    - `disease`: disease name
-    - `confidence`: confidence percentage
-    - `top_3`: top 3 predictions with confidence scores
-    - `is_healthy`: whether the plant is predicted healthy
+    Returns predicted disease, confidence score, and top 3 predictions.
     """
     # Validate file type
     if file.content_type not in ("image/jpeg", "image/png", "image/jpg", "image/webp"):
@@ -185,7 +177,7 @@ async def predict(file: UploadFile = File(..., description="Plant leaf image (JP
     if size_mb > MAX_FILE_SIZE_MB:
         raise HTTPException(
             status_code=413,
-            detail=f"File too large ({size_mb:.1f}MB). Maximum allowed is {MAX_FILE_SIZE_MB}MB."
+            detail=f"File too large ({size_mb:.1f}MB). Maximum is {MAX_FILE_SIZE_MB}MB."
         )
 
     # Preprocess
@@ -196,21 +188,23 @@ async def predict(file: UploadFile = File(..., description="Plant leaf image (JP
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Image preprocessing failed: {str(e)}")
 
-    # Predict
+    # Predict using TFLite interpreter
     try:
         start = time.perf_counter()
-        predictions = ml_model.predict(input_arr, verbose=0)[0]  # shape: (38,)
+        interpreter.set_tensor(input_details[0]['index'], input_arr)
+        interpreter.invoke()
+        predictions  = interpreter.get_tensor(output_details[0]['index'])[0]  # shape: (38,)
         inference_ms = (time.perf_counter() - start) * 1000
-        logger.info("Prediction completed in %.1fms", inference_ms)
+        logger.info("Prediction done in %.1fms", inference_ms)
     except Exception as e:
         logger.error("Prediction error: %s", e)
         raise HTTPException(status_code=500, detail="Model inference failed.")
 
     # Format results
-    best_idx      = int(np.argmax(predictions))
-    top3_indices  = np.argsort(predictions)[::-1][:3]
-    best_name     = format_disease_name(class_names[best_idx])
-    is_healthy    = "healthy" in class_names[best_idx].lower()
+    best_idx     = int(np.argmax(predictions))
+    top3_indices = np.argsort(predictions)[::-1][:3]
+    best_name    = format_disease_name(class_names[best_idx])
+    is_healthy   = "healthy" in class_names[best_idx].lower()
 
     top3 = [
         {
