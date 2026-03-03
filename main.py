@@ -49,13 +49,8 @@ async def lifespan(app: FastAPI):
 
     # ── Load TFLite model ─────────────────────────────────────────────────────
     logger.info("Loading TFLite model...")
-    try:
-        import tflite_runtime.interpreter as tflite
-        interpreter = tflite.Interpreter(model_path=str(MODEL_PATH))
-    except ImportError:
-        import tensorflow as tf
-        interpreter = tf.lite.Interpreter(model_path=str(MODEL_PATH))
-
+    import tensorflow as tf
+    interpreter = tf.lite.Interpreter(model_path=str(MODEL_PATH))
     interpreter.allocate_tensors()
     input_details  = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
